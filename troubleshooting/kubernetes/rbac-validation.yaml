@@ -1,0 +1,92 @@
+###############################################################################
+# Troubleshooting: RBAC / Permission Validation
+###############################################################################
+---
+# ── kubectl auth can-i validation Job ────────────────────────────────────────
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: rbac-audit
+  namespace: troubleshooting
+  labels:
+    scenario: rbac-validation
+spec:
+  ttlSecondsAfterFinished: 300
+  template:
+    spec:
+      restartPolicy: Never
+      serviceAccountName: rbac-audit-sa
+      containers:
+        - name: rbac-check
+          image: bitnami/kubectl:latest
+          command:
+            - /bin/sh
+            - -c
+            - |
+              echo "=== RBAC self-check for SA: $(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace) ==="
+
+              echo "--- Can I list pods? ---"
+              kubectl auth can-i list pods --namespace default
+
+              echo "--- Can I create deployments? ---"
+              kubectl auth can-i create deployments --namespace default
+
+              echo "--- Can I delete secrets? ---"
+              kubectl auth can-i delete secrets --namespace default
+
+              echo "--- Can I exec into pods? ---"
+              kubectl auth can-i create pods/exec --namespace default
+
+              echo "--- All permissions in default namespace ---"
+              kubectl auth can-i --list --namespace default
+
+              echo "--- Cluster-wide permissions ---"
+              kubectl auth can-i --list
+
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "300m"
+              memory: "256Mi"
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: rbac-audit-sa
+  namespace: troubleshooting
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: rbac-auditor
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "services", "configmaps", "namespaces"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "replicasets", "daemonsets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["roles", "rolebindings", "clusterroles", "clusterrolebindings"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["authorization.k8s.io"]
+    resources: ["selfsubjectaccessreviews", "selfsubjectrulesreviews"]
+    verbs: ["create"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: rbac-auditor-binding
+subjects:
+  - kind: ServiceAccount
+    name: rbac-audit-sa
+    namespace: troubleshooting
+roleRef:
+  kind: ClusterRole
+  name: rbac-auditor
+  apiGroup: rbac.authorization.k8s.io

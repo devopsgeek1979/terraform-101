@@ -1,0 +1,7 @@
+terraform {
+  required_version = ">= 1.6.0"
+
+  backend "local" {
+    path = "/mnt/san/terraform-state/vsphere/global/terraform.tfstate"
+  }
+}

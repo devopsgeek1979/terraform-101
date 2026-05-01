@@ -1,0 +1,206 @@
+###############################################################################
+# Troubleshooting: Kubernetes CNI Failures, ImagePullBackOff, OOMKills
+###############################################################################
+
+---
+# ── CNI Connectivity Check — netshoot DaemonSet ───────────────────────────────
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: cni-connectivity-check
+  namespace: troubleshooting
+  labels:
+    app: cni-check
+    scenario: cni-failure
+spec:
+  selector:
+    matchLabels:
+      app: cni-check
+  template:
+    metadata:
+      labels:
+        app: cni-check
+    spec:
+      tolerations:
+        - operator: "Exists"
+      containers:
+        - name: netshoot
+          image: nicolaka/netshoot:latest
+          command:
+            - /bin/bash
+            - -c
+            - |
+              echo "Node: $(hostname)"
+              echo "=== Pod IP ==="
+              ip addr show eth0
+
+              echo "=== Default route ==="
+              ip route
+
+              echo "=== CNI bridge/overlay interfaces ==="
+              ip link show
+
+              echo "=== Connectivity to kube-apiserver ==="
+              curl -sk https://kubernetes.default.svc.cluster.local/healthz
+
+              echo "=== DNS Check ==="
+              nslookup kubernetes.default.svc.cluster.local
+
+              echo "=== Inter-pod ping (requires another pod IP) ==="
+              ping -c5 ${TARGET_POD_IP:-127.0.0.1} || true
+
+              sleep 3600
+          env:
+            - name: TARGET_POD_IP
+              value: "REPLACE_WITH_TARGET_POD_IP"
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "200m"
+              memory: "128Mi"
+          securityContext:
+            capabilities:
+              add: ["NET_ADMIN", "NET_RAW"]
+
+---
+# ── ImagePullBackOff Debugger Job ─────────────────────────────────────────────
+# Run this to validate registry credentials and image availability
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: image-pull-debug
+  namespace: troubleshooting
+  labels:
+    scenario: imagepullbackoff
+spec:
+  ttlSecondsAfterFinished: 300
+  template:
+    spec:
+      restartPolicy: Never
+      # Mount the registry secret so we can inspect it
+      volumes:
+        - name: docker-config
+          secret:
+            secretName: REPLACE_WITH_REGISTRY_SECRET_NAME
+            optional: true
+      containers:
+        - name: skopeo
+          image: quay.io/skopeo/stable:latest
+          command:
+            - /bin/sh
+            - -c
+            - |
+              echo "=== Testing registry credentials ==="
+              skopeo inspect \
+                --authfile /docker/.dockerconfigjson \
+                docker://${REGISTRY_IMAGE:-docker.io/library/nginx:latest} \
+                2>&1 || echo "ERROR: Cannot pull image — check credentials"
+
+              echo "=== Registry connectivity ==="
+              curl -I https://${REGISTRY_HOST:-registry-1.docker.io}/v2/ 2>&1
+
+          env:
+            - name: REGISTRY_IMAGE
+              value: "REPLACE_WITH_YOUR_IMAGE:TAG"
+            - name: REGISTRY_HOST
+              value: "REPLACE_WITH_REGISTRY_HOSTNAME"
+          volumeMounts:
+            - name: docker-config
+              mountPath: /docker
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+
+---
+# ── OOMKill Detector — PrometheusRule ─────────────────────────────────────────
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: k8s-oomkill-alerts
+  namespace: monitoring
+  labels:
+    prometheus: kube-prometheus
+    role: alert-rules
+spec:
+  groups:
+    - name: oom-kills
+      rules:
+        - alert: ContainerOOMKilled
+          expr: |
+            kube_pod_container_status_last_terminated_reason{reason="OOMKilled"} == 1
+          for: 0m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Container OOMKilled: {{ $labels.container }} in {{ $labels.namespace }}/{{ $labels.pod }}"
+            description: |
+              Container {{ $labels.container }} in pod {{ $labels.pod }} (ns: {{ $labels.namespace }})
+              was OOM-killed. Increase memory limits or investigate memory leak.
+            runbook_url: "https://runbooks.example.com/oomkilled"
+
+        - alert: PodCrashLooping
+          expr: |
+            rate(kube_pod_container_status_restarts_total[15m]) * 60 * 15 > 0
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Pod CrashLooping: {{ $labels.pod }} in {{ $labels.namespace }}"
+            description: "Pod {{ $labels.pod }} has restarted more than once in 15 minutes."
+
+        - alert: ImagePullBackOff
+          expr: |
+            kube_pod_container_status_waiting_reason{reason=~"ImagePullBackOff|ErrImagePull"} == 1
+          for: 2m
+          labels:
+            severity: warning
+          annotations:
+            summary: "ImagePullBackOff: {{ $labels.container }} in {{ $labels.namespace }}"
+            description: |
+              Container {{ $labels.container }} in pod {{ $labels.pod }} cannot pull image.
+              Check registry credentials, image name/tag, and network access.
+
+        - alert: CNIPodNotReady
+          expr: |
+            kube_pod_status_ready{condition="false"} == 1
+              and on(pod, namespace)
+            kube_pod_status_phase{phase="Running"} == 1
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Pod not ready despite Running phase: {{ $labels.pod }}"
+            description: "Check CNI plugin, readiness probes, and pod events."
+
+---
+# ── CNI Debug ConfigMap — collect logs ───────────────────────────────────────
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cni-debug-commands
+  namespace: troubleshooting
+data:
+  commands.sh: |
+    #!/bin/bash
+    # Run on any node via kubectl debug node/<nodename> -it --image=nicolaka/netshoot
+
+    echo "=== Installed CNI plugins ==="
+    ls -la /opt/cni/bin/
+
+    echo "=== CNI configuration ==="
+    cat /etc/cni/net.d/*.conf 2>/dev/null || cat /etc/cni/net.d/*.conflist
+
+    echo "=== kubelet CNI logs ==="
+    journalctl -u kubelet --since "30 minutes ago" | grep -i cni | tail -50
+
+    echo "=== iptables rules (NAT) ==="
+    iptables -t nat -L -n --line-numbers | grep -E "KUBE|CNI" | head -40
+
+    echo "=== IP routes ==="
+    ip route show table all | head -40

@@ -1,0 +1,132 @@
+###############################################################################
+# Troubleshooting: CPU/Memory Stress Testing — Compute Tier
+###############################################################################
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: troubleshooting
+
+---
+# ── CPU Stress Job ────────────────────────────────────────────────────────────
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: cpu-stress-test
+  namespace: troubleshooting
+  labels:
+    scenario: compute-stress
+spec:
+  ttlSecondsAfterFinished: 600
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: stress-ng
+          image: alexeiled/stress-ng:latest
+          command:
+            - stress-ng
+            - --cpu
+            - "4"
+            - --cpu-method
+            - "matrixprod"
+            - --timeout
+            - "120s"
+            - --metrics-brief
+          resources:
+            requests:
+              cpu: "2000m"
+              memory: "256Mi"
+            limits:
+              cpu: "4000m"
+              memory: "512Mi"
+
+---
+# ── Memory Stress Job ─────────────────────────────────────────────────────────
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: memory-stress-test
+  namespace: troubleshooting
+  labels:
+    scenario: memory-pressure
+spec:
+  ttlSecondsAfterFinished: 600
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: stress-ng
+          image: alexeiled/stress-ng:latest
+          command:
+            - stress-ng
+            - --vm
+            - "2"
+            - --vm-bytes
+            - "512M"
+            - --vm-method
+            - "all"
+            - --timeout
+            - "120s"
+            - --metrics-brief
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "1Gi"
+            limits:
+              cpu: "1000m"
+              memory: "2Gi"
+
+---
+# ── Disk Pressure Alert — PrometheusRule ──────────────────────────────────────
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: disk-pressure-alerts
+  namespace: monitoring
+  labels:
+    prometheus: kube-prometheus
+    role: alert-rules
+spec:
+  groups:
+    - name: disk-pressure
+      rules:
+        - alert: NodeDiskPressure
+          expr: kube_node_status_condition{condition="DiskPressure", status="true"} == 1
+          for: 2m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Node {{ $labels.node }} is under disk pressure"
+            description: "Node {{ $labels.node }} has DiskPressure condition true for 2+ minutes."
+
+        - alert: NodeFilesystemAlmostOutOfSpace
+          expr: |
+            (node_filesystem_avail_bytes{job="node-exporter",fstype!="tmpfs"}
+              / node_filesystem_size_bytes{job="node-exporter",fstype!="tmpfs"}) < 0.10
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Filesystem {{ $labels.device }} on {{ $labels.instance }} < 10% free"
+            description: "Only {{ $value | humanizePercentage }} space remaining."
+
+        - alert: HighCPUThrottle
+          expr: |
+            rate(container_cpu_cfs_throttled_seconds_total[5m])
+              / rate(container_cpu_cfs_periods_total[5m]) > 0.25
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Container {{ $labels.container }} CPU throttled >25%"
+            description: "Pod {{ $labels.pod }} in {{ $labels.namespace }} is being CPU throttled."
+
+        - alert: OOMKillDetected
+          expr: increase(node_vmstat_oom_kill[1m]) > 0
+          for: 0m
+          labels:
+            severity: critical
+          annotations:
+            summary: "OOM kill detected on {{ $labels.instance }}"
+            description: "A container was OOM-killed on node {{ $labels.instance }}."

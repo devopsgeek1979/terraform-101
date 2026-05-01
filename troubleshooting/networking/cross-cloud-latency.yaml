@@ -1,0 +1,151 @@
+###############################################################################
+# Troubleshooting: Cross-Cloud VPN/Interconnect Latency
+# Deploy netshoot + MTR pod for live network path analysis
+###############################################################################
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: troubleshooting
+  labels:
+    purpose: network-diagnostics
+
+---
+# ── MTR / Netshoot Pod for latency testing ────────────────────────────────────
+apiVersion: v1
+kind: Pod
+metadata:
+  name: netshoot-latency
+  namespace: troubleshooting
+  labels:
+    app: netshoot-latency
+    scenario: cross-cloud-vpn-latency
+spec:
+  restartPolicy: Never
+  containers:
+    - name: netshoot
+      image: nicolaka/netshoot:latest
+      command: ["/bin/bash"]
+      args:
+        - "-c"
+        - |
+          echo "=== MTR to AWS VPC endpoint ==="
+          mtr --report --report-cycles 20 --tcp -P 443 ${AWS_TARGET_IP:-8.8.8.8} | tee /tmp/mtr-aws.txt
+
+          echo "=== MTR to Azure VNet endpoint ==="
+          mtr --report --report-cycles 20 --tcp -P 443 ${AZURE_TARGET_IP:-8.8.4.4} | tee /tmp/mtr-azure.txt
+
+          echo "=== TCP Ping latency test (iperf3 server required) ==="
+          iperf3 -c ${IPERF_TARGET:-127.0.0.1} -t 30 -P 4 --logfile /tmp/iperf.txt || true
+
+          echo "=== Traceroute ==="
+          traceroute -n ${AWS_TARGET_IP:-8.8.8.8}
+
+          echo "=== DNS Resolution ==="
+          dig +stats +time=5 ${DNS_TARGET:-google.com}
+
+          echo "Done. Check /tmp/ for results."
+          sleep 3600
+      env:
+        - name: AWS_TARGET_IP
+          value: "REPLACE_WITH_AWS_VPN_ENDPOINT"
+        - name: AZURE_TARGET_IP
+          value: "REPLACE_WITH_AZURE_VPN_ENDPOINT"
+        - name: IPERF_TARGET
+          value: "REPLACE_WITH_IPERF_SERVER_IP"
+        - name: DNS_TARGET
+          value: "REPLACE_WITH_DNS_NAME"
+      resources:
+        requests:
+          cpu: "100m"
+          memory: "128Mi"
+        limits:
+          cpu: "500m"
+          memory: "256Mi"
+      securityContext:
+        capabilities:
+          add: ["NET_ADMIN", "NET_RAW"]
+        runAsNonRoot: false
+
+---
+# ── ConfigMap: Collect results via log export ─────────────────────────────────
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: latency-test-config
+  namespace: troubleshooting
+data:
+  targets.env: |
+    AWS_VPN_ENDPOINT=REPLACE_WITH_AWS_VPN_ENDPOINT
+    AZURE_VPN_ENDPOINT=REPLACE_WITH_AZURE_VPN_ENDPOINT
+    GCP_INTERCONNECT_ENDPOINT=REPLACE_WITH_GCP_INTERCONNECT_ENDPOINT
+    VSPHERE_GATEWAY=REPLACE_WITH_VSPHERE_GATEWAY_IP
+  test_matrix.yaml: |
+    tests:
+      - name: aws-to-azure
+        source: aws
+        target: azure
+        protocol: TCP
+        port: 443
+        cycles: 20
+      - name: aws-to-gcp
+        source: aws
+        target: gcp
+        protocol: TCP
+        port: 443
+        cycles: 20
+      - name: vsphere-to-aws
+        source: vsphere
+        target: aws
+        protocol: ICMP
+        cycles: 10
+
+---
+# ── DaemonSet: Continuous packet capture on all nodes ─────────────────────────
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: tcpdump-capture
+  namespace: troubleshooting
+  labels:
+    app: tcpdump-capture
+spec:
+  selector:
+    matchLabels:
+      app: tcpdump-capture
+  template:
+    metadata:
+      labels:
+        app: tcpdump-capture
+    spec:
+      tolerations:
+        - key: "node-role.kubernetes.io/control-plane"
+          operator: "Exists"
+          effect: "NoSchedule"
+      hostNetwork: true
+      containers:
+        - name: tcpdump
+          image: nicolaka/netshoot:latest
+          command:
+            - /bin/bash
+            - -c
+            - |
+              tcpdump -i any -w /captures/$(hostname)-$(date +%Y%m%d%H%M%S).pcap \
+                -G 300 -W 10 'tcp port 443 or icmp'
+          volumeMounts:
+            - name: captures
+              mountPath: /captures
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "200m"
+              memory: "256Mi"
+          securityContext:
+            capabilities:
+              add: ["NET_ADMIN", "NET_RAW"]
+      volumes:
+        - name: captures
+          emptyDir:
+            sizeLimit: 2Gi

@@ -1,0 +1,47 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: troubleshooting-vmware
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: tkgs-netshoot
+  namespace: troubleshooting-vmware
+  labels:
+    app: tkgs-netshoot
+spec:
+  restartPolicy: Never
+  containers:
+    - name: netshoot
+      image: nicolaka/netshoot:latest
+      command: ["/bin/bash", "-c"]
+      args:
+        - |
+          echo "=== DNS ==="
+          nslookup kubernetes.default.svc.cluster.local
+          nslookup ${TARGET_DNS_NAME:-example.internal}
+          echo "=== Route ==="
+          ip route
+          echo "=== Latency ==="
+          mtr --report --report-cycles 20 ${TARGET_IP:-8.8.8.8} || true
+          echo "=== TCP Check ==="
+          nc -vz ${TARGET_IP:-8.8.8.8} ${TARGET_PORT:-443} || true
+          sleep 3600
+      env:
+        - name: TARGET_IP
+          value: "REPLACE_TARGET_IP"
+        - name: TARGET_PORT
+          value: "443"
+        - name: TARGET_DNS_NAME
+          value: "REPLACE_DNS_NAME"
+      resources:
+        requests:
+          cpu: "50m"
+          memory: "64Mi"
+        limits:
+          cpu: "300m"
+          memory: "256Mi"
+      securityContext:
+        capabilities:
+          add: ["NET_ADMIN", "NET_RAW"]

@@ -1,0 +1,78 @@
+###############################################################################
+# Troubleshooting: Storage I/O Benchmarking
+###############################################################################
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: fio-bench-pvc
+  namespace: troubleshooting
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: "REPLACE_WITH_YOUR_STORAGE_CLASS"
+  resources:
+    requests:
+      storage: 50Gi
+
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: fio-storage-benchmark
+  namespace: troubleshooting
+  labels:
+    scenario: storage-io-benchmark
+spec:
+  ttlSecondsAfterFinished: 600
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: fio
+          image: ljishen/fio:latest
+          command:
+            - /bin/sh
+            - -c
+            - |
+              echo "=== Sequential Read ==="
+              fio --name=seq-read --rw=read --bs=1M --size=10G \
+                --filename=/data/testfile --direct=1 --numjobs=4 \
+                --iodepth=32 --runtime=60 --time_based \
+                --output-format=json | tee /tmp/seq-read.json
+
+              echo "=== Sequential Write ==="
+              fio --name=seq-write --rw=write --bs=1M --size=10G \
+                --filename=/data/testfile --direct=1 --numjobs=4 \
+                --iodepth=32 --runtime=60 --time_based \
+                --output-format=json | tee /tmp/seq-write.json
+
+              echo "=== Random Read IOPS ==="
+              fio --name=rand-read --rw=randread --bs=4k --size=10G \
+                --filename=/data/testfile --direct=1 --numjobs=8 \
+                --iodepth=64 --runtime=60 --time_based \
+                --output-format=json | tee /tmp/rand-read.json
+
+              echo "=== Random Write IOPS ==="
+              fio --name=rand-write --rw=randwrite --bs=4k --size=10G \
+                --filename=/data/testfile --direct=1 --numjobs=8 \
+                --iodepth=64 --runtime=60 --time_based \
+                --output-format=json | tee /tmp/rand-write.json
+
+              echo "=== Summary ==="
+              cat /tmp/seq-read.json /tmp/seq-write.json \
+                  /tmp/rand-read.json /tmp/rand-write.json
+
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+            limits:
+              cpu: "2000m"
+              memory: "1Gi"
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: fio-bench-pvc

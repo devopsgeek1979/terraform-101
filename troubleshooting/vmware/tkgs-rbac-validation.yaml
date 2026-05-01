@@ -1,0 +1,66 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: troubleshooting-vmware
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: vmware-rbac-audit-sa
+  namespace: troubleshooting-vmware
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: vmware-rbac-auditor
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "services", "configmaps", "namespaces"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "daemonsets", "statefulsets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["authorization.k8s.io"]
+    resources: ["selfsubjectaccessreviews", "selfsubjectrulesreviews"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: vmware-rbac-auditor-binding
+subjects:
+  - kind: ServiceAccount
+    name: vmware-rbac-audit-sa
+    namespace: troubleshooting-vmware
+roleRef:
+  kind: ClusterRole
+  name: vmware-rbac-auditor
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: vmware-rbac-check
+  namespace: troubleshooting-vmware
+spec:
+  ttlSecondsAfterFinished: 300
+  template:
+    spec:
+      restartPolicy: Never
+      serviceAccountName: vmware-rbac-audit-sa
+      containers:
+        - name: kubectl
+          image: bitnami/kubectl:latest
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              kubectl auth can-i --list
+              kubectl auth can-i list pods -A
+              kubectl auth can-i create pods/exec -n kube-system
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "300m"
+              memory: "256Mi"
